@@ -1,0 +1,2 @@
+# These run on Linux; a CRLF checkout on Windows would break them there.
+* text=auto eol=lf
