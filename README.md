@@ -72,7 +72,7 @@ on a CUDA 13.0 host. No volume is needed — nothing is stored.
 On RunPod, as a serverless **load-balancing endpoint**: same image and port,
 with `PORT=1529`, `PORT_HEALTH=1529`, `SLIP_TOKEN` and `SLIP_IDLE_SHUTDOWN_S=0`
 (the endpoint scales to zero by itself). RunPod keeps the image pulled on the
-endpoint's idle workers, so a start is the model load alone — about 40 s
+endpoint's idle workers, so a start is the model load alone — 40 to 75 s
 instead of the three to four minutes a fresh pod needs to download the image.
 Call it at `https://<endpoint id>.api.runpod.ai` with the RunPod API key as the
 bearer and the token in `X-Slip-Token`. Requests are capped at 30 MB there, so
