@@ -42,11 +42,17 @@ def _touch() -> None:
 def _authorized(scope) -> bool:
     if not TOKEN:
         return False  # fail closed: a pod without a token serves nobody
-    want = b"Bearer " + TOKEN.encode()
+    token = TOKEN.encode()
+    ok = False
     for name, value in scope.get("headers", []):
+        # A pod is called with the token as the bearer. A serverless endpoint
+        # is called with the RunPod API key there (RunPod's load balancer
+        # requires it), so the token travels in a header of its own.
         if name == b"authorization":
-            return hmac.compare_digest(value, want)
-    return False
+            ok = ok or hmac.compare_digest(value, b"Bearer " + token)
+        elif name == b"x-slip-token":
+            ok = ok or hmac.compare_digest(value, token)
+    return ok
 
 
 async def _reply(send, status: int, body: bytes, content_type: bytes = b"application/json", extra=()) -> None:

@@ -19,9 +19,11 @@ docker pull ghcr.io/imagin4care/slip-server:latest
 
 `pod_main.py` adds three things:
 
-- **Token check.** Every request needs `Authorization: Bearer $SLIP_TOKEN`.
-  Without `SLIP_TOKEN` set the server answers nobody. `GET /ping` is the only
-  open route (liveness, returns `ok`).
+- **Token check.** Every request needs `Authorization: Bearer $SLIP_TOKEN`, or
+  the token alone in `X-Slip-Token` (for a serverless endpoint, where RunPod
+  takes the `Authorization` header for the account's API key). Without
+  `SLIP_TOKEN` set the server answers nobody. `GET /ping` is the only open
+  route (liveness, returns `ok`).
 - **Chunked uploads.** RunPod's HTTP proxy rejects request bodies near 100 MB
   and a CT volume is larger. A client sends `PUT /_relay/<id>/<n>` chunks in
   order, then `POST /_relay/<id>/commit` with `X-Relay-Path` and
@@ -47,7 +49,7 @@ SLIP is point-only: the bbox, scribble and lasso routes answer `501`.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SLIP_TOKEN` | *(required)* | shared secret for the bearer check |
+| `SLIP_TOKEN` | *(required)* | shared secret for the token check |
 | `SLIP_IDLE_SHUTDOWN_S` | `420` | idle seconds before the pod deletes itself; `0` disables the watchdog |
 | `SLIP_MAX_LIFETIME_S` | `28800` | hard cap on a pod's life, whatever the activity |
 | `SLIP_TORCH_COMPILE` | `0` | `1` trades a slow first click for faster later ones |
@@ -64,8 +66,18 @@ docker run --gpus all -p 1529:1529 -e SLIP_TOKEN=change-me -e SLIP_IDLE_SHUTDOWN
 curl http://localhost:1529/ping
 ```
 
-On RunPod: expose `1529/http`, set `SLIP_TOKEN`, pick a 16 GB+ card on a
-CUDA 13.0 host. No volume is needed — nothing is stored.
+On RunPod, as a pod: expose `1529/http`, set `SLIP_TOKEN`, pick a 16 GB+ card
+on a CUDA 13.0 host. No volume is needed — nothing is stored.
+
+On RunPod, as a serverless **load-balancing endpoint**: same image and port,
+with `PORT=1529`, `PORT_HEALTH=1529`, `SLIP_TOKEN` and `SLIP_IDLE_SHUTDOWN_S=0`
+(the endpoint scales to zero by itself). RunPod keeps the image pulled on the
+endpoint's idle workers, so a start is the model load alone — about 40 s
+instead of the three to four minutes a fresh pod needs to download the image.
+Call it at `https://<endpoint id>.api.runpod.ai` with the RunPod API key as the
+bearer and the token in `X-Slip-Token`. Requests are capped at 30 MB there, so
+larger uploads go through `/_relay` as above. Use one running worker: the
+session lives in the worker's memory.
 
 Volumes smaller than SLIP's 32×192×192 patch are edge-padded before
 embedding and the padding is cropped off every returned mask, so voxel
