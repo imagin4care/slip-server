@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
+from scipy import ndimage
 
 from SLIP_model.inference_module import Inference_module
 
@@ -56,6 +57,7 @@ STATE = {
     "coarse_active": False,  # current embeddings come from a downsized pass
     "rearm_coarse": False,   # next first click should re-embed coarse
     "clicks": [],          # [([z,y,x], label)] of the current object, for replay
+    "seed": None,          # the label's voxels the object started from, uint8, or None
     "last_mask": None,     # accumulated object mask, uploaded shape, uint8
     "history": [],         # packed accumulated masks, one per click, for undo
 }
@@ -211,16 +213,30 @@ def _seed_patch_priors(mask: np.ndarray) -> None:
         ).squeeze(0).squeeze(0).to(p.dtype)
 
 
-def _start_object() -> None:
-    """Forget the current object's clicks and arm coarse for its first click.
+def _start_object(seed=None) -> None:
+    """Forget the current object's clicks; the object starts as `seed`.
 
-    The re-embed is deferred to that click (see add_point) so starting a new
-    object stays instant even when the volume uses coarse sessions.
+    `seed` is the label's existing voxels (or None): clicks then refine it
+    (_accumulate) and undoing every click comes back to it. Coarse is re-armed
+    only when a promotion has replaced the coarse embeddings — right after an
+    upload they still are coarse, and embedding them again just made the first
+    click wait. The re-embed is deferred to that click (see add_point) so
+    starting a new object stays instant.
     """
     STATE["clicks"] = []
-    STATE["last_mask"] = None
+    STATE["seed"] = seed
+    STATE["last_mask"] = seed
     STATE["history"] = []
-    STATE["rearm_coarse"] = STATE["coarse_req"] > 0
+    STATE["rearm_coarse"] = STATE["coarse_req"] > 0 and not STATE["coarse_active"]
+
+
+def _begin_object(seed=None) -> None:
+    """A new object on the current embeddings, starting from `seed`."""
+    _predictor.reset()
+    _start_object(seed)
+    # A pending coarse re-embed would drop the priors; add_point seeds them then.
+    if seed is not None and not STATE["rearm_coarse"]:
+        _seed_patch_priors(seed)
 
 
 def _replay_clicks(clicks):
@@ -287,7 +303,25 @@ def _mask_body(m: np.ndarray) -> Response:
     )
 
 
-def _accumulate(raw: np.ndarray, positive: bool) -> np.ndarray:
+def _region_at(mask: np.ndarray, zyx) -> np.ndarray:
+    """The connected part of `mask` that holds voxel `zyx` (empty when none does)."""
+    z, y, x = (min(max(int(c), 0), s - 1) for c, s in zip(zyx, mask.shape))
+    out = np.zeros(mask.shape, dtype=np.uint8)
+    if not mask[z, y, x]:
+        return out
+    # Label the mask's bounding box only: labelling a whole CT takes seconds.
+    box = []
+    for others in ((1, 2), (0, 2), (0, 1)):
+        hit = np.flatnonzero(mask.any(axis=others))
+        box.append(slice(int(hit[0]), int(hit[-1]) + 1))
+    box = tuple(box)
+    labels, _ = ndimage.label(mask[box])
+    at = labels[z - box[0].start, y - box[1].start, x - box[2].start]
+    out[box] = labels == at
+    return out
+
+
+def _accumulate(raw: np.ndarray, positive: bool, click) -> np.ndarray:
     """Fold one click's raw SLIP output into the object mask, monotonically.
 
     SLIP re-decodes and re-blends every patch on each click, and a patch the
@@ -296,26 +330,28 @@ def _accumulate(raw: np.ndarray, positive: bool) -> np.ndarray:
     earlier clicks (or an injected prior, which is only +-8) had established
     there — that is why click 2 could destroy click 1's result. Clicks are
     therefore applied as deltas against the accumulated object instead of
-    replacing it: a positive click may only ADD, a negative may only REMOVE.
+    replacing it: a positive click may only ADD, a negative may only REMOVE,
+    and only the region it was placed on — the same blending drops parts far
+    from the click, which would otherwise erase an existing segmentation.
     """
     prev = STATE["last_mask"]
     if prev is None or prev.shape != raw.shape:
         return raw
-    out = (prev | raw) if positive else (prev & raw)
+    out = (prev | raw) if positive else (prev & (1 - _region_at(prev & (1 - raw), click)))
     added = int((out & ~prev).sum())
     removed = int((prev & ~out).sum())
-    ignored = int((raw & ~out).sum()) if positive else int((~raw & prev & ~out).sum())
+    ignored = int((raw != out).sum())
     print(f"click {'+' if positive else '-'}: +{added} -{removed} voxels "
-          f"({ignored} non-monotonic changes ignored)", flush=True)
+          f"({ignored} changes SLIP proposed were not applied)", flush=True)
     return out
 
 
-def _mask_response(mask_t, positive: bool | None = None) -> Response:
+def _mask_response(mask_t, positive: bool | None = None, click=None) -> Response:
     m = _to_client_mask(mask_t)
     if positive is not None:
         STATE["history"].append(np.packbits(STATE["last_mask"])
                                 if STATE["last_mask"] is not None else None)
-        m = _accumulate(m, positive)
+        m = _accumulate(m, positive, click)
     STATE["last_mask"] = m
     return _mask_body(m)
 
@@ -349,6 +385,7 @@ async def upload_image(file: UploadFile = File(...), coarse: int = Form(0)):
             STATE["coarse_req"] = coarse
             STATE["rearm_coarse"] = False
             STATE["clicks"] = []
+            STATE["seed"] = None
             STATE["last_mask"] = None
             STATE["history"] = []
             _process(vol, coarse=coarse)
@@ -367,27 +404,31 @@ async def upload_image(file: UploadFile = File(...), coarse: int = Form(0)):
 
 @app.post("/upload_segment")
 async def upload_segment(file: UploadFile = File(...)):
-    # SLIP cannot ingest a seed mask; treat any upload as "start a new object":
-    # reset the memory bank + click history by re-processing the cached volume.
+    # Start a new object from the label's existing voxels (all zeros for an
+    # empty label). SLIP has no seed-mask API: the seed becomes the object's
+    # accumulated mask, which every click refines (_accumulate), and every
+    # patch's prior (_seed_patch_priors), which SLIP's decoder refines.
     raw = await file.read()
     if raw[:2] == b"\x1f\x8b":
         raw = gzip.decompress(raw)
     seed = np.load(io.BytesIO(raw))
-    if seed.any():
-        print("upload_segment: non-empty seed ignored (SLIP starts objects from clicks)", flush=True)
 
     def work():
         with _lock:
             if STATE["volume"] is None:
                 return JSONResponse({"error": "no image uploaded"}, status_code=409)
+            if seed.shape != STATE["shape"]:
+                return JSONResponse({"error": f"segment shape {list(seed.shape)} is not the image's "
+                                              f"{list(STATE['shape'])}"}, status_code=400)
             # reset() clears the memory bank, undo stack, and click history but keeps
             # the patch embeddings — a new object is instant instead of a re-embed.
             # Any coarse re-arm is deferred to the first click (see add_point).
-            if STATE["ready"]:
-                _predictor.reset()
-                _start_object()
-            else:
+            if not STATE["ready"]:
                 _process(STATE["volume"], coarse=STATE["coarse_req"])
+            start = (seed > 0).astype(np.uint8) if seed.any() else None
+            _begin_object(start)
+            if start is not None:
+                print(f"upload_segment: object starts from {int(start.sum())} existing voxels", flush=True)
             return JSONResponse({"status": "ok"})
 
     return await asyncio.to_thread(work)
@@ -408,10 +449,12 @@ async def add_point(req: Request):
             if STATE["rearm_coarse"] and not STATE["clicks"]:
                 _process(STATE["volume"], coarse=STATE["coarse_req"])
                 STATE["rearm_coarse"] = False
+                if STATE["seed"] is not None:  # the re-embed dropped the seed's priors
+                    _seed_patch_priors(STATE["seed"])
             first = not STATE["clicks"]
             mask = _predictor.click_inference([[z, y, x]], [label])
             STATE["clicks"].append(([z, y, x], label))
-            return _mask_response(mask, positive=bool(label)), first and STATE["coarse_active"]
+            return _mask_response(mask, positive=bool(label), click=(z, y, x)), first and STATE["coarse_active"]
 
     body, promote = await asyncio.to_thread(work)
     if promote:
@@ -437,10 +480,10 @@ async def undo_interaction():
                 return JSONResponse({"error": "nothing to undo"}, status_code=409)
             if len(_predictor.action_history) == 1:
                 # Undoing the only click: skip upstream undo (its recombine assumes
-                # surviving per-patch masks) and just reset to an empty object.
-                _predictor.reset()
-                _start_object()
-                return _mask_body(np.zeros(STATE["shape"], dtype=np.uint8))
+                # surviving per-patch masks) and start the object over from its seed.
+                seed = STATE["seed"]
+                _begin_object(seed)
+                return _mask_body(seed if seed is not None else np.zeros(STATE["shape"], dtype=np.uint8))
             # Roll SLIP's own state back so later clicks behave, but return the
             # ACCUMULATED mask this object had before the undone click — the
             # recombine cannot reproduce it (see _accumulate).

@@ -76,8 +76,19 @@ endpoint's idle workers, so a start is the model load alone — 40 to 75 s
 instead of the three to four minutes a fresh pod needs to download the image.
 Call it at `https://<endpoint id>.api.runpod.ai` with the RunPod API key as the
 bearer and the token in `X-Slip-Token`. Requests are capped at 30 MB there, so
-larger uploads go through `/_relay` as above. Use one running worker: the
-session lives in the worker's memory.
+larger uploads go through `/_relay` as above. Set **max workers to 1**: the
+session lives in the worker's memory, and RunPod's load balancer spreads
+requests over every running worker, so with two of them clicks reach one that
+never saw the volume ("no image processed").
+
+## Tests
+
+The wrapper's session logic runs on CPU against a scripted stand-in for SLIP:
+
+```bash
+pip install pytest httpx fastapi python-multipart numpy torch scipy
+python -m pytest tests
+```
 
 Volumes smaller than SLIP's 32×192×192 patch are edge-padded before
 embedding and the padding is cropped off every returned mask, so voxel
